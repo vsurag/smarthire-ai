@@ -8,7 +8,7 @@ import re
 from dotenv import load_dotenv
 import anthropic
 
-load_dotenv()
+load_dotenv(dotenv_path="../.env")
 
 # ── APP SETUP ─────────────────────────────────────────────
 app = FastAPI(
