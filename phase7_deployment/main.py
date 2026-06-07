@@ -1,12 +1,17 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 import os
 import json
 import re
+import io
 from dotenv import load_dotenv
 import anthropic
+import pypdf
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 load_dotenv(dotenv_path="../.env")
 
@@ -18,10 +23,13 @@ app = FastAPI(
 )
 
 # ── CORS ──────────────────────────────────────────────────
-# This allows your React frontend to call this API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:5174",
+        "http://localhost:3000"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -76,14 +84,11 @@ JOB_REQUIREMENTS = {
 }
 
 # ── CONVERSATION STORE ────────────────────────────────────
-# In production this would be Redis or a database
 conversation_store = {}
 
 
 # ══════════════════════════════════════════════════════════
 # REQUEST / RESPONSE MODELS
-# Pydantic models define exactly what each endpoint
-# accepts and returns — automatic validation + docs
 # ══════════════════════════════════════════════════════════
 
 class JDRequest(BaseModel):
@@ -100,7 +105,7 @@ class JDResponse(BaseModel):
 class ScreenRequest(BaseModel):
     job_description: str
     resume: str
-    technique: str = "zero-shot"  # zero-shot, few-shot, chain-of-thought
+    technique: str = "zero-shot"
 
 class ScreenResponse(BaseModel):
     candidate_name: str
@@ -122,7 +127,8 @@ class ChatResponse(BaseModel):
     message_count: int
 
 class PipelineRequest(BaseModel):
-    candidate_name: str
+    candidate_name: str = ""
+    resume_text: str = ""
 
 class PipelineResponse(BaseModel):
     candidate: dict
@@ -139,7 +145,6 @@ class PipelineResponse(BaseModel):
 
 @app.get("/")
 def root():
-    """Health check — confirms API is running"""
     return {
         "status": "running",
         "product": "SmartHire AI API",
@@ -149,6 +154,7 @@ def root():
             "POST /api/screen-resume",
             "POST /api/chat",
             "POST /api/run-pipeline",
+            "POST /api/extract-pdf",
             "GET  /api/candidates",
             "GET  /docs"
         ]
@@ -157,7 +163,6 @@ def root():
 
 @app.get("/api/candidates")
 def get_candidates():
-    """Returns list of all candidates in the system"""
     return {
         "candidates": [
             {
@@ -175,11 +180,7 @@ def get_candidates():
 
 @app.post("/api/generate-jd", response_model=JDResponse)
 async def generate_jd(request: JDRequest):
-    """
-    Phase 1 — Generate a professional job description.
-    Takes job title, company, experience, tone.
-    Returns full JD text.
-    """
+    """Phase 1 — Generate a professional job description."""
     try:
         message = client.messages.create(
             model=MODEL,
@@ -208,11 +209,7 @@ Include: role summary (2-3 lines), 5 key responsibilities,
 
 @app.post("/api/screen-resume", response_model=ScreenResponse)
 async def screen_resume(request: ScreenRequest):
-    """
-    Phase 2 — Screen a resume against a job description.
-    Supports zero-shot, few-shot, chain-of-thought techniques.
-    Returns structured JSON score with breakdown.
-    """
+    """Phase 2 — Screen a resume against a job description."""
     try:
         if request.technique == "chain-of-thought":
             prompt = f"""Think step by step then give final JSON.
@@ -257,7 +254,6 @@ RESUME: {request.resume}"""
         )
         raw = message.content[0].text
 
-        # Parse JSON from response
         match = re.search(r'\{.*\}', raw, re.DOTALL)
         if match:
             result = json.loads(match.group())
@@ -280,18 +276,13 @@ RESUME: {request.resume}"""
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
-    """
-    Phase 3 — Candidate Q&A chatbot with memory.
-    Uses session_id to maintain conversation history.
-    Returns AI reply + message count.
-    """
+    """Phase 3 — Candidate Q&A chatbot with memory."""
     JOB_CONTEXT = """Company: SmartHire Technologies | Role: Python Developer
 Experience: 2+ years | Location: Hyderabad (Hybrid) | Salary: ₹8-15 LPA
 Required: Python, FastAPI, PostgreSQL, Git
 Nice to have: Docker, AWS, LangChain
 Benefits: Health insurance, 15 days leave, L&D budget, flexible hours"""
 
-    # Get or create conversation history
     if request.session_id not in conversation_store:
         conversation_store[request.session_id] = []
 
@@ -309,8 +300,6 @@ Be warm, professional, and helpful. Keep replies concise (2-3 sentences).""",
         )
         reply = response.content[0].text
         history.append({"role": "assistant", "content": reply})
-
-        # Keep last 20 messages only
         conversation_store[request.session_id] = history[-20:]
 
         return ChatResponse(
@@ -322,46 +311,96 @@ Be warm, professional, and helpful. Keep replies concise (2-3 sentences).""",
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/extract-pdf")
+async def extract_pdf(file: UploadFile = File(...)):
+    """Extract text from an uploaded PDF resume."""
+    try:
+        contents = await file.read()
+        pdf_reader = pypdf.PdfReader(io.BytesIO(contents))
+        text = ""
+        for page in pdf_reader.pages:
+            text += page.extract_text() + "\n"
+
+        if not text.strip():
+            raise HTTPException(status_code=400, detail="Could not extract text from PDF")
+
+        return {
+            "filename": file.filename,
+            "text": text.strip(),
+            "pages": len(pdf_reader.pages)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/run-pipeline", response_model=PipelineResponse)
 async def run_pipeline(request: PipelineRequest):
-    """
-    Phase 5+6 — Run the full LangGraph hiring pipeline.
-    Screens candidate → routes → drafts interview or rejection email.
-    Returns complete pipeline result.
-    """
-    key = request.candidate_name.lower().strip()
-    if key not in CANDIDATES_DB:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Candidate '{request.candidate_name}' not found"
-        )
+    """Phase 5+6 — Run the full LangGraph hiring pipeline."""
 
-    candidate = CANDIDATES_DB[key]
+    # If resume_text provided, extract candidate info using Claude
+    if request.resume_text:
+        try:
+            extract_msg = client.messages.create(
+                model=MODEL,
+                max_tokens=512,
+                system="Extract candidate info from resume. Return ONLY valid JSON, no extra text.",
+                messages=[{
+                    "role": "user",
+                    "content": f"""Extract from this resume:
+{request.resume_text}
+
+Return ONLY this JSON:
+{{
+    "name": "full name",
+    "experience": years as integer,
+    "skills": ["skill1", "skill2"],
+    "location": "city",
+    "salary_expectation": expected salary in LPA as integer or 10,
+    "email": "email or candidate@email.com"
+}}"""
+                }]
+            )
+            raw = extract_msg.content[0].text
+            match = re.search(r'\{.*\}', raw, re.DOTALL)
+            candidate = json.loads(match.group()) if match else {}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to parse resume: {str(e)}")
+    else:
+        key = request.candidate_name.lower().strip()
+        if key not in CANDIDATES_DB:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Candidate '{request.candidate_name}' not found"
+            )
+        candidate = CANDIDATES_DB[key]
 
     # Score the candidate
     score = 0
     breakdown = []
 
-    if candidate["experience"] >= JOB_REQUIREMENTS["min_experience"]:
-        exp_score = min(30, candidate["experience"] * 8)
+    exp = candidate.get("experience", 0)
+    if exp >= JOB_REQUIREMENTS["min_experience"]:
+        exp_score = min(30, exp * 8)
         score += exp_score
-        breakdown.append(f"Experience: {candidate['experience']} yrs (+{exp_score}pts)")
+        breakdown.append(f"Experience: {exp} yrs (+{exp_score}pts)")
     else:
-        breakdown.append(f"Experience too low: {candidate['experience']} yrs")
+        breakdown.append(f"Experience too low: {exp} yrs")
 
-    matched = [s for s in JOB_REQUIREMENTS["required_skills"] if s in candidate["skills"]]
-    missing  = [s for s in JOB_REQUIREMENTS["required_skills"] if s not in candidate["skills"]]
+    skills = candidate.get("skills", [])
+    matched = [s for s in JOB_REQUIREMENTS["required_skills"] if s in skills]
+    missing  = [s for s in JOB_REQUIREMENTS["required_skills"] if s not in skills]
     skill_score = int(len(matched) / len(JOB_REQUIREMENTS["required_skills"]) * 40)
     score += skill_score
     breakdown.append(f"Skills: {len(matched)}/{len(JOB_REQUIREMENTS['required_skills'])} matched (+{skill_score}pts)")
 
-    bonus = [s for s in JOB_REQUIREMENTS["nice_to_have"] if s in candidate["skills"]]
+    bonus = [s for s in JOB_REQUIREMENTS["nice_to_have"] if s in skills]
     bonus_score = min(15, len(bonus) * 5)
     score += bonus_score
     if bonus:
         breakdown.append(f"Bonus skills: {bonus} (+{bonus_score}pts)")
 
-    if candidate["salary_expectation"] <= JOB_REQUIREMENTS["budget_lpa"]:
+    salary = candidate.get("salary_expectation", 0)
+    if salary <= JOB_REQUIREMENTS["budget_lpa"]:
         score += 15
         breakdown.append(f"Salary fits budget (+15pts)")
     else:
@@ -369,23 +408,25 @@ async def run_pipeline(request: PipelineRequest):
 
     # Route decision
     path = "interviewer" if score >= 55 else "rejector"
+    name = candidate.get("name", "Candidate")
+    email = candidate.get("email", "candidate@email.com")
 
     # Draft email with Claude
     if path == "interviewer":
         email_prompt = f"""Write a warm professional interview invitation for:
-Candidate: {candidate['name']}
-Email: {candidate['email']}
-Experience: {candidate['experience']} years
-Skills: {', '.join(candidate['skills'][:3])}
+Candidate: {name}
+Email: {email}
+Experience: {exp} years
+Skills: {', '.join(skills[:3])}
 Score: {score}/100
 
 Role: Python Developer at SmartHire Technologies
 Interview slot: Next Monday 10:00 AM IST (Google Meet)
 Format: TO / SUBJECT / email body"""
     else:
-        email_prompt = f"""Write a kind, encouraging rejection email for:
-Candidate: {candidate['name']}
-Email: {candidate['email']}
+        email_prompt = f"""Write a kind encouraging rejection email for:
+Candidate: {name}
+Email: {email}
 Score: {score}/100
 Missing skills: {missing}
 
@@ -400,7 +441,7 @@ Format: TO / SUBJECT / email body"""
             system="You are a professional, empathetic HR at SmartHire Technologies.",
             messages=[{"role": "user", "content": email_prompt}]
         )
-        email = email_response.content[0].text
+        email_draft = email_response.content[0].text
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -410,10 +451,38 @@ Format: TO / SUBJECT / email body"""
         score_breakdown=breakdown,
         decision="PROCEED TO INTERVIEW" if path == "interviewer" else "NOT SELECTED",
         path=path,
-        email_draft=email
+        email_draft=email_draft
     )
 
+class SendEmailRequest(BaseModel):
+    to_email: str
+    subject: str
+    body: str
 
+@app.post("/api/send-email")
+async def send_email(request: SendEmailRequest):
+    """Send real email via Gmail SMTP"""
+    try:
+        smtp_email = os.getenv("SMTP_EMAIL")
+        smtp_password = os.getenv("SMTP_PASSWORD")
+
+        if not smtp_email or not smtp_password:
+            raise HTTPException(status_code=500, detail="Email credentials not configured")
+
+        msg = MIMEMultipart()
+        msg["From"] = smtp_email
+        msg["To"] = request.to_email
+        msg["Subject"] = request.subject
+        msg.attach(MIMEText(request.body, "plain"))
+
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(smtp_email, smtp_password)
+            server.send_message(msg)
+
+        return {"status": "sent", "to": request.to_email}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+        
 # ── RUN ───────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
